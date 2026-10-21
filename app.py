@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import csv
 import ctypes
+import html
+from ctypes import wintypes
 import json
 import logging
 import os
@@ -32,6 +34,7 @@ APP_NAME = "DeviceBatteryTray"
 CONFIG_PATH = Path(os.environ.get("LOCALAPPDATA", Path.home())) / APP_NAME / "config.json"
 LOG_PATH = CONFIG_PATH.with_name("diagnostic.log")
 HISTORY_DIR = CONFIG_PATH.parent
+BUTTONS_DIR = CONFIG_PATH.parent
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 LOG = logging.getLogger("battery_tray")
 OVERLAY_WIDTH = 260
@@ -180,6 +183,132 @@ def new_history_path(directory: Path, when: datetime | None = None) -> Path:
     return candidate
 
 
+BUTTON_NAMES = {"left": "左键", "right": "右键", "wheel_up": "滚轮上", "wheel_down": "滚轮下",
+                "side1": "侧键1", "side2": "侧键2"}
+
+
+def new_button_history_path(directory: Path, when: datetime | None = None) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = (when or datetime.now().astimezone()).strftime("%Y%m%d_%H%M%S")
+    candidate = directory / f"mouse_buttons_{stamp}.csv"
+    suffix = 2
+    while candidate.exists():
+        candidate = directory / f"mouse_buttons_{stamp}_{suffix}.csv"
+        suffix += 1
+    with candidate.open("x", newline="", encoding="utf-8-sig") as stream:
+        csv.DictWriter(stream, fieldnames=("time", "button", "down_time", "duration_ms")).writeheader()
+    return candidate
+
+
+def append_button_event(path: Path, button: str, when: datetime, down_time: datetime | None,
+                        duration_ms: float | None) -> None:
+    with path.open("a", newline="", encoding="utf-8") as stream:
+        csv.DictWriter(stream, fieldnames=("time", "button", "down_time", "duration_ms")).writerow({
+            "time": when.isoformat(timespec="milliseconds"), "button": button,
+            "down_time": down_time.isoformat(timespec="milliseconds") if down_time else "",
+            "duration_ms": "" if duration_ms is None else f"{duration_ms:.1f}"})
+
+
+def button_summary(directory: Path) -> dict[str, int]:
+    totals = {name: 0 for name in BUTTON_NAMES}
+    for path in directory.glob("mouse_buttons_*.csv"):
+        try:
+            with path.open(encoding="utf-8-sig", newline="") as stream:
+                for row in csv.DictReader(stream):
+                    if row.get("button") in totals:
+                        totals[row["button"]] += 1
+        except OSError:
+            continue
+    return totals
+
+
+class MouseButtonRecorder:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.stop_event = threading.Event()
+        self.events: queue.Queue[tuple[str, str, datetime, datetime | None, float | None]] = queue.Queue()
+        self.down: dict[str, tuple[datetime, float]] = {}
+        self.counts = {name: 0 for name in BUTTON_NAMES}
+        self.thread: threading.Thread | None = None
+        self._callback = None
+        self._hook = None
+        self.thread_id = None
+
+    @staticmethod
+    def decode(message: int, data: int) -> tuple[str, bool] | None:
+        down = message in (0x0201, 0x0204, 0x0207, 0x020B)
+        up = message in (0x0202, 0x0205, 0x0208, 0x020C)
+        if not (down or up):
+            if message == 0x020A:
+                return ("wheel_up" if ctypes.c_short((data >> 16) & 0xffff).value > 0 else "wheel_down", True)
+            return None
+        if message in (0x020B, 0x020C):
+            return ("side1" if ((data >> 16) & 0xffff) == 1 else "side2"), down
+        names = {0x0201: "left", 0x0202: "left", 0x0204: "right", 0x0205: "right",
+                 0x0207: "side1", 0x0208: "side1"}
+        return names[message], down
+
+    def _run(self) -> None:
+        user32 = ctypes.windll.user32
+        self.thread_id = user32.GetCurrentThreadId()
+        ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+        class MSLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [("pt", POINT), ("mouseData", ctypes.c_ulong), ("flags", ctypes.c_ulong),
+                        ("time", ctypes.c_ulong), ("dwExtraInfo", ULONG_PTR)]
+        CALLBACK = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, ctypes.c_size_t, ctypes.POINTER(MSLLHOOKSTRUCT))
+        def hook(code, message, pointer):
+            if code >= 0 and pointer:
+                decoded = self.decode(message, pointer.contents.mouseData)
+                if decoded:
+                    button, is_down = decoded
+                    now = datetime.now().astimezone()
+                    if button.startswith("wheel"):
+                        self.events.put(("event", button, now, None, None))
+                    elif is_down:
+                        self.down.setdefault(button, (now, time.monotonic()))
+                    elif button in self.down:
+                        started, monotonic = self.down.pop(button)
+                        self.events.put(("event", button, now, started, (time.monotonic() - monotonic) * 1000))
+            return user32.CallNextHookEx(self._hook, code, message, pointer)
+        self._callback = CALLBACK(hook)
+        self._hook = user32.SetWindowsHookExW(14, self._callback, None, 0)
+        if not self._hook:
+            LOG.error("Could not install global mouse hook")
+            return
+        msg = wintypes.MSG()
+        while not self.stop_event.is_set() and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg)); user32.DispatchMessageW(ctypes.byref(msg))
+        user32.UnhookWindowsHookEx(self._hook)
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self._run, name="mouse-hook", daemon=True)
+        self.thread.start()
+
+    def drain(self) -> None:
+        while True:
+            try:
+                _, button, when, down_time, duration = self.events.get_nowait()
+            except queue.Empty:
+                return
+            append_button_event(self.path, button, when, down_time, duration)
+            self.counts[button] += 1
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self._hook:
+            if self.thread_id:
+                ctypes.windll.user32.PostThreadMessageW(self.thread_id, 0x0012, 0, 0)
+        if self.thread:
+            self.thread.join(timeout=1)
+        now = datetime.now().astimezone()
+        for button, (started, _monotonic) in list(self.down.items()):
+            append_button_event(self.path, button, now, started, None)
+        self.down.clear()
+        self.drain()
+
+
 def tooltip(name: str, state: DeviceState) -> str:
     if not state.connected:
         return f"{name}: 未连接"
@@ -205,6 +334,8 @@ class BatteryApp:
         self.root.title("设备电量")
         self.config = load_config()
         self.history_path = new_history_path(HISTORY_DIR)
+        self.button_history_path = new_button_history_path(BUTTONS_DIR)
+        self.button_recorder = MouseButtonRecorder(self.button_history_path)
         self.commands: queue.Queue[str] = queue.Queue()
         self.states = {"beats": DeviceState(), "mouse": DeviceState()}
         self.stop_event = threading.Event()
@@ -255,6 +386,8 @@ class BatteryApp:
                 pystray.MenuItem("开机启动", lambda _icon, _item: self.commands.put("startup"),
                                  checked=lambda _item: startup_enabled()),
                 pystray.MenuItem("打开电量记录", lambda _icon, _item: self.commands.put("history")),
+                pystray.MenuItem("查看按键统计", lambda _icon, _item: self.commands.put("stats")),
+                pystray.MenuItem("生成 HTML 按键报告", lambda _icon, _item: self.commands.put("report")),
                 pystray.MenuItem("打开诊断日志", lambda _icon, _item: self.commands.put("log")),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("退出", lambda _icon, _item: self.commands.put("quit")),
@@ -299,6 +432,7 @@ class BatteryApp:
         self._save_config()
 
     def _drain_commands(self) -> None:
+        self.button_recorder.drain()
         while True:
             try:
                 command = self.commands.get_nowait()
@@ -327,8 +461,13 @@ class BatteryApp:
                     os.startfile(HISTORY_DIR)
                 except OSError:
                     LOG.exception("Could not open battery history folder")
+            elif command == "stats":
+                self._show_stats()
+            elif command == "report":
+                self._make_report()
             elif command == "quit":
                 self.stop_event.set()
+                self.button_recorder.stop()
                 if self.ble_loop and self.refresh_event:
                     self.ble_loop.call_soon_threadsafe(self.refresh_event.set)
                 for icon in self.icons.values():
@@ -341,6 +480,40 @@ class BatteryApp:
                     self.states[kind] = state
                     self._render(kind)
         self.root.after(200, self._drain_commands)
+
+    def _show_stats(self) -> None:
+        self.button_recorder.drain()
+        if getattr(self, "stats_window", None) and self.stats_window.winfo_exists():
+            self.stats_window.lift(); return
+        win = tk.Toplevel(self.root); win.title("鼠标按键统计"); win.resizable(False, False)
+        self.stats_window = win
+        tk.Label(win, text="全部历史记录（启动后实时更新）", font=("Segoe UI", 10, "bold")).pack(padx=18, pady=(14, 4))
+        lines = tk.StringVar(); tk.Label(win, textvariable=lines, justify="left", font=("Consolas", 10)).pack(padx=18, pady=8)
+        def refresh():
+            self.button_recorder.drain()
+            totals = button_summary(BUTTONS_DIR)
+            lines.set("\n".join(f"{BUTTON_NAMES[k]:<5} {totals[k]:>8} 次" for k in BUTTON_NAMES))
+            if win.winfo_exists(): win.after(1000, refresh)
+        refresh()
+
+    def _make_report(self) -> None:
+        rows = []
+        for path in sorted(BUTTONS_DIR.glob("mouse_buttons_*.csv")):
+            try:
+                with path.open(encoding="utf-8-sig", newline="") as stream:
+                    rows.extend(csv.DictReader(stream))
+            except OSError:
+                continue
+        counts = {k: 0 for k in BUTTON_NAMES}; durations = {k: [] for k in BUTTON_NAMES}
+        for row in rows:
+            key = row.get("button", "")
+            if key in counts:
+                counts[key] += 1
+                if row.get("duration_ms"): durations[key].append(float(row["duration_ms"]))
+        report = HISTORY_DIR / "mouse_button_report.html"
+        body = "".join(f"<tr><td>{html.escape(BUTTON_NAMES[k])}</td><td>{counts[k]}</td><td>{(sum(durations[k])/len(durations[k])):.1f} ms</td><td>{(max(durations[k]) if durations[k] else 0):.1f} ms</td></tr>" for k in BUTTON_NAMES)
+        report.write_text("<meta charset='utf-8'><title>鼠标按键统计</title><h1>鼠标按键统计</h1><table border='1' cellpadding='6'><tr><th>按键</th><th>次数</th><th>平均按下时长</th><th>最长按下时长</th></tr>" + body + "</table>", encoding="utf-8")
+        os.startfile(report)
 
     def _render(self, kind: str) -> None:
         state = self.states[kind]
@@ -453,6 +626,7 @@ class BatteryApp:
         for icon in self.icons.values():
             icon.run_detached()
         threading.Thread(target=lambda: asyncio.run(self._monitor()), daemon=True).start()
+        self.button_recorder.start()
         if self.config.get("visible", False):
             self.show_window()
         self.root.after(200, self._drain_commands)

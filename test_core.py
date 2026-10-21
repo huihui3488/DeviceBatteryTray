@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, patch
 import asyncio
 
 from battery_core import AppleAdvertisements, DeviceState, make_mouse_request, parse_apple_proximity, parse_mouse_reply, read_beats, read_mouse
-from app import append_history, format_level, icon_image, new_history_path, position_visible, tooltip
+from app import (MouseButtonRecorder, append_history, format_level, icon_image,
+                 new_button_history_path, new_history_path, position_visible, tooltip)
 
 
 class BatteryCoreTests(unittest.TestCase):
@@ -81,6 +82,21 @@ class BatteryCoreTests(unittest.TestCase):
             self.assertTrue(first.name.startswith("battery_history_20261020_143500"))
             self.assertEqual(first.read_text(encoding="utf-8-sig").splitlines()[0],
                              "time,device,connected,level,left,right,case,charging,source")
+
+    def test_mouse_button_messages_map_wheel_and_buttons(self):
+        self.assertEqual(MouseButtonRecorder.decode(0x0201, 0), ("left", True))
+        self.assertEqual(MouseButtonRecorder.decode(0x0202, 0), ("left", False))
+        self.assertEqual(MouseButtonRecorder.decode(0x020A, 120 << 16), ("wheel_up", True))
+        self.assertEqual(MouseButtonRecorder.decode(0x020A, (0x10000 - 120) << 16), ("wheel_down", True))
+        self.assertEqual(MouseButtonRecorder.decode(0x020B, 1 << 16), ("side1", True))
+        self.assertEqual(MouseButtonRecorder.decode(0x020C, 2 << 16), ("side2", False))
+
+    def test_button_history_file_is_new_and_has_wheel_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = new_button_history_path(Path(directory), datetime(2026, 10, 21, 10, 20, tzinfo=timezone.utc))
+            self.assertTrue(path.name.startswith("mouse_buttons_20261021_102000"))
+            self.assertEqual(path.read_text(encoding="utf-8-sig").splitlines()[0],
+                             "time,button,down_time,duration_ms")
 
     def test_beats_prefers_parts_then_windows_fallback(self):
         ads = AppleAdvertisements()
